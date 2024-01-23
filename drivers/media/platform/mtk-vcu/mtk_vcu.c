@@ -308,6 +308,9 @@ struct mtk_vcu {
 	struct log_test_nofuse *vdec_log_info;
 	wait_queue_head_t vdec_log_get_wq;
 	atomic_t vdec_log_got;
+	wait_queue_head_t vdec_log_set_wq;
+	atomic_t vdec_log_set;
+	struct mutex log_lock;
 	struct cmdq_base *clt_base;
 	struct cmdq_client *clt_vdec[GCE_THNUM_MAX];
 	struct cmdq_client *clt_venc[GCE_THNUM_MAX];
@@ -323,7 +326,8 @@ struct mtk_vcu {
 	struct gce_ctx_info gce_info[VCODEC_INST_MAX];
 	atomic_t gce_job_cnt[VCU_CODEC_MAX][GCE_THNUM_MAX];
 	unsigned long flags[VCU_CODEC_MAX];
-	int open_cnt;
+	atomic_t open_cnt;
+	struct mutex vcu_dev_mutex;
 	bool abort;
 	struct semaphore vpud_killed;
 	bool is_entering_suspend;
@@ -408,7 +412,7 @@ int vcu_ipi_send(struct platform_device *pdev,
 
 	mutex_lock(&vcu->vcu_mutex[i]);
 	if (vcu_ptr->abort) {
-		if (vcu_ptr->open_cnt > 0) {
+		if (atomic_read(&vcu_ptr->open_cnt) > 0) {
 			dev_info(vcu->dev, "wait for vpud killed %d\n",
 				vcu_ptr->vpud_killed.count);
 			ret = down_interruptible(&vcu_ptr->vpud_killed);
@@ -439,11 +443,13 @@ int vcu_ipi_send(struct platform_device *pdev,
 
 	if (vcu_ptr->abort || ret == 0) {
 		dev_info(&pdev->dev, "vcu ipi %d ack time out !%d", id, ret);
-		if (!vcu_ptr->abort) {
+		vcu_get_file_lock();
+		if (!vcu_ptr->abort && vcud_task) {
 			send_sig(SIGTERM, vcud_task, 0);
 			send_sig(SIGKILL, vcud_task, 0);
 		}
-		if (vcu_ptr->open_cnt > 0) {
+		vcu_put_file_lock();
+		if (atomic_read(&vcu_ptr->open_cnt) > 0) {
 			dev_info(vcu->dev, "wait for vpud killed %d\n",
 				vcu_ptr->vpud_killed.count);
 			ret = down_interruptible(&vcu_ptr->vpud_killed);
@@ -534,6 +540,7 @@ static int vcu_log_get(struct mtk_vcu *vcu, unsigned long arg)
 			vcu->vcuid, ret, __func__);
 		return ret;
 	}
+
 	ret = copy_to_user(user_data_addr, vcu->vdec_log_info,
 			   (unsigned long)sizeof(struct log_test_nofuse));
 	if (ret != 0) {
@@ -546,6 +553,26 @@ static int vcu_log_get(struct mtk_vcu *vcu, unsigned long arg)
 	return ret;
 }
 
+static int vcu_log_set(struct mtk_vcu *vcu, unsigned long arg)
+{
+	int ret;
+	unsigned char *user_data_addr = NULL;
+
+	user_data_addr = (unsigned char *)arg;
+
+	ret = (long)copy_from_user(vcu->vdec_log_info, user_data_addr,
+				(unsigned long)sizeof(struct log_test_nofuse));
+	if (ret != 0) {
+		pr_info("[VCU] %s(%d) Copy data from user failed!\n",
+			__func__, __LINE__);
+		return -EINVAL;
+	}
+
+	atomic_set(&vcu->vdec_log_set, 1);
+	wake_up(&vcu->vdec_log_set_wq);
+
+	return ret;
+}
 
 static int vcu_gce_set_inst_id(void *ctx, u64 gce_handle)
 {
@@ -1522,6 +1549,8 @@ static int mtk_vcu_open(struct inode *inode, struct file *file)
 	int vcuid = 0;
 	struct mtk_vcu_queue *vcu_queue;
 
+	mutex_lock(&vcu_ptr->vcu_dev_mutex);
+
 	if (strcmp(current->comm, "camd") == 0)
 		vcuid = 2;
 	else if (strcmp(current->comm, "mdpd") == 0)
@@ -1532,6 +1561,7 @@ static int mtk_vcu_open(struct inode *inode, struct file *file)
 			(current->tgid != vcud_task->tgid ||
 			current->group_leader != vcud_task->group_leader)) {
 			vcu_put_file_lock();
+			mutex_unlock(&vcu_ptr->vcu_dev_mutex);
 			return -EACCES;
 		}
 		vcud_task = current->group_leader;
@@ -1546,24 +1576,30 @@ static int mtk_vcu_open(struct inode *inode, struct file *file)
 	}
 
 	vcu_mtkdev[vcuid]->vcuid = vcuid;
-	if (IS_ERR_OR_NULL(vcu_mtkdev[vcuid]->clt_vdec[0]))
+	if (IS_ERR_OR_NULL(vcu_mtkdev[vcuid]->clt_vdec[0])) {
+		mutex_unlock(&vcu_ptr->vcu_dev_mutex);
 		return -EINVAL;
+	}
 
 	vcu_queue = mtk_vcu_mem_init(vcu_mtkdev[vcuid]->dev,
 		vcu_mtkdev[vcuid]->clt_vdec[0]->chan->mbox->dev);
 
-	if (vcu_queue == NULL)
+	if (vcu_queue == NULL) {
+		mutex_unlock(&vcu_ptr->vcu_dev_mutex);
 		return -ENOMEM;
+	}
 	vcu_queue->vcu = vcu_mtkdev[vcuid];
 	file->private_data = vcu_queue;
 	vcu_ptr->vpud_killed.count = 0;
-	vcu_ptr->open_cnt++;
+	atomic_inc(&vcu_ptr->open_cnt);
 	vcu_ptr->abort = false;
 	vcu_ptr->vpud_is_going_down = 0;
 
 	pr_info("[VCU] %s name: %s pid %d tgid %d open_cnt %d current %p group_leader %p\n",
 		__func__, current->comm, current->pid, current->tgid,
-		vcu_ptr->open_cnt, current, current->group_leader);
+		atomic_read(&vcu_ptr->open_cnt), current, current->group_leader);
+
+	mutex_unlock(&vcu_ptr->vcu_dev_mutex);
 
 	return 0;
 }
@@ -1571,13 +1607,15 @@ static int mtk_vcu_open(struct inode *inode, struct file *file)
 static int mtk_vcu_release(struct inode *inode, struct file *file)
 {
 	unsigned long flags;
+	struct task_struct *task = NULL;
+
+	mutex_lock(&vcu_ptr->vcu_dev_mutex);
 
 	if (file->private_data)
 		mtk_vcu_mem_release((struct mtk_vcu_queue *)file->private_data);
 	pr_info("[VCU] %s name: %s pid %d open_cnt %d\n", __func__,
-		current->comm, current->tgid, vcu_ptr->open_cnt);
-	vcu_ptr->open_cnt--;
-	if (vcu_ptr->open_cnt == 0) {
+		current->comm, current->tgid, atomic_read(&vcu_ptr->open_cnt));
+	if (atomic_dec_and_test(&vcu_ptr->open_cnt)) {
 		/* reset vpud due to abnormal situations. */
 		vcu_ptr->abort = true;
 		vcu_get_file_lock();
@@ -1593,7 +1631,15 @@ static int mtk_vcu_release(struct inode *inode, struct file *file)
 
 		if (vcu_ptr->curr_ctx[VCU_VDEC])
 			vdec_check_release_lock(vcu_ptr->curr_ctx[VCU_VDEC]);
+	} else {
+		vcu_get_file_lock();
+		vcu_get_task(&task, NULL, 0);
+		if (current == task)
+			vcu_get_task(NULL, NULL, 1);
+		vcu_put_file_lock();
 	}
+
+	mutex_unlock(&vcu_ptr->vcu_dev_mutex);
 
 	return 0;
 }
@@ -1860,6 +1906,9 @@ static long mtk_vcu_unlocked_ioctl(struct file *file, unsigned int cmd,
 	case VCU_GET_LOG_OBJECT:
 		ret = vcu_log_get(vcu_dev, arg);
 		break;
+	case VCU_SET_LOG_OBJECT:
+		ret = vcu_log_set(vcu_dev, arg);
+		break;
 	case VCU_MVA_ALLOCATION:
 	case VCU_PA_ALLOCATION:
 		user_data_addr = (unsigned char *)arg;
@@ -2057,6 +2106,7 @@ static long mtk_vcu_unlocked_compat_ioctl(struct file *file, unsigned int cmd,
 	case COMPAT_VCU_SET_OBJECT:
 	case VCU_GET_OBJECT:
 	case VCU_GET_LOG_OBJECT:
+	case VCU_SET_LOG_OBJECT:
 	case VCU_GCE_SET_CMD_FLUSH:
 	case VCU_GCE_WAIT_CALLBACK:
 		share_data32 = compat_ptr((uint32_t)arg);
@@ -2143,9 +2193,21 @@ static long mtk_vcu_unlocked_compat_ioctl(struct file *file, unsigned int cmd,
 
 int mtk_vcu_write(const char *val, const struct kernel_param *kp)
 {
+	int wait_cnt = 0;
+
 	if (vcu_ptr != NULL &&
 		vcu_ptr->vdec_log_info != NULL &&
 		val != NULL) {
+		/* wait vpud got log done */
+		while (atomic_read(&vcu_ptr->vdec_log_got) != 0) {
+			wait_cnt++;
+			if (wait_cnt > 10) {
+				pr_info("[VCU] %s(%d) timeout return\n", __func__, __LINE__);
+				return -EFAULT;
+			}
+			usleep_range(10000, 20000);
+		}
+		vcu_ptr->vdec_log_info->type = 0;
 		memcpy(vcu_ptr->vdec_log_info->log_info,
 			val, strnlen(val, LOG_INFO_SIZE - 1) + 1);
 	} else {
@@ -2166,8 +2228,9 @@ int mtk_vcu_write(const char *val, const struct kernel_param *kp)
 		return 0;
 	}
 
-	pr_info("[log wakeup VPUD] log_info %p vcu_ptr %p val %p: %s %lu\n",
+	pr_info("[S: log wakeup VPUD] log_info %p type %d vcu_ptr %p val %p: %s %lu\n",
 		(char *)vcu_ptr->vdec_log_info->log_info,
+		vcu_ptr->vdec_log_info->type,
 		vcu_ptr, val, val,
 		(unsigned long)strnlen(val, LOG_INFO_SIZE - 1) + 1);
 
@@ -2177,11 +2240,84 @@ int mtk_vcu_write(const char *val, const struct kernel_param *kp)
 	return 0;
 }
 
+// mtk-vcodec call vcu_set_log to set log to vcu/vpud
 int vcu_set_log(const char *val)
 {
-	return mtk_vcu_write(val, NULL);
+	int ret = 0;
+
+	if (!vcu_ptr) {
+		pr_info("[VCU] %s(%d) return\n", __func__, __LINE__);
+		return -EFAULT;
+	}
+	mutex_lock(&vcu_ptr->log_lock);
+	ret = mtk_vcu_write(val, NULL);
+	mutex_unlock(&vcu_ptr->log_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(vcu_set_log);
+
+// mtk-vcodec call vcu_get_log to get log from vcu/vpud
+int vcu_get_log(char *val, unsigned int val_len)
+{
+	int ret = -1;
+	int len;
+	int wait_cnt = 0;
+
+	if (vcu_ptr != NULL &&
+		vcu_ptr->vdec_log_info != NULL &&
+		val != NULL && val_len <= 1024) {
+
+		mutex_lock(&vcu_ptr->log_lock);
+
+		/* wait vpud got log done */
+		while (atomic_read(&vcu_ptr->vdec_log_got) != 0) {
+			wait_cnt++;
+			if (wait_cnt > 10) {
+				pr_info("[VCU] %s(%d) timeout return\n", __func__, __LINE__);
+				mutex_unlock(&vcu_ptr->log_lock);
+				return -EFAULT;
+			}
+			usleep_range(10000, 20000);
+		}
+		vcu_ptr->vdec_log_info->type = 1;
+	} else {
+		pr_info("[VCU] %s(%d) return\n", __func__, __LINE__);
+		mutex_unlock(&vcu_ptr->log_lock);
+		return -EFAULT;
+	}
+
+	pr_info("[G: log wakeup VPUD] log_info %p type %d vcu_ptr %p\n",
+		(char *)vcu_ptr->vdec_log_info->log_info,
+		vcu_ptr->vdec_log_info->type, vcu_ptr);
+
+	atomic_set(&vcu_ptr->vdec_log_got, 1);
+	wake_up(&vcu_ptr->vdec_log_get_wq);
+
+	// wait vpud set log to vcu done
+	ret = wait_event_freezable(vcu_ptr->vdec_log_set_wq,
+				atomic_read(&vcu_ptr->vdec_log_set));
+	if (ret != 0) {
+		pr_info("[VCU][%d] wait event return %d @%s\n",
+			vcu_ptr->vcuid, ret, __func__);
+		mutex_unlock(&vcu_ptr->log_lock);
+		return ret;
+	}
+
+	atomic_set(&vcu_ptr->vdec_log_set, 0);
+	strncpy(val, (char *)vcu_ptr->vdec_log_info->log_info, val_len);
+
+	// append vcu log
+	len = strlen(val);
+	if (len < val_len)
+		SNPRINTF(val + len, val_len - 1 - len,
+			" %s %d", "-vcu_log", vcu_ptr->enable_vcu_dbg_log);
+
+	pr_info("[VCU] %s log_info: %s\n", __func__, val);
+	mutex_unlock(&vcu_ptr->log_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vcu_get_log);
 
 static struct kernel_param_ops log_param_ops = {
 	.set = mtk_vcu_write,
@@ -2386,11 +2522,14 @@ static int mtk_vcu_probe(struct platform_device *pdev)
 	init_waitqueue_head(&vcu->gce_wq[VCU_VDEC]);
 	init_waitqueue_head(&vcu->gce_wq[VCU_VENC]);
 	init_waitqueue_head(&vcu->vdec_log_get_wq);
+	init_waitqueue_head(&vcu->vdec_log_set_wq);
 	atomic_set(&vcu->ipi_got[VCU_VDEC], 0);
 	atomic_set(&vcu->ipi_got[VCU_VENC], 0);
 	atomic_set(&vcu->ipi_done[VCU_VDEC], 1);
 	atomic_set(&vcu->ipi_done[VCU_VENC], 1);
 	atomic_set(&vcu->vdec_log_got, 0);
+	atomic_set(&vcu->vdec_log_set, 0);
+	mutex_init(&vcu->log_lock);
 	for (i = 0; i < (int)VCODEC_INST_MAX; i++) {
 		atomic_set(&vcu->gce_info[i].flush_done, 0);
 		atomic_set(&vcu->gce_info[i].flush_pending, 0);
@@ -2405,6 +2544,8 @@ static int mtk_vcu_probe(struct platform_device *pdev)
 	atomic_set(&vcu->gce_job_cnt[VCU_VDEC][1], 0);
 	atomic_set(&vcu->gce_job_cnt[VCU_VENC][0], 0);
 	atomic_set(&vcu->gce_job_cnt[VCU_VENC][1], 0);
+	atomic_set(&vcu->open_cnt, 0);
+	mutex_init(&vcu->vcu_dev_mutex);
 	/* init character device */
 
 	ret = alloc_chrdev_region(&vcu_mtkdev[vcuid]->vcu_devno, 0, 1,
